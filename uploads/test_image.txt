@@ -1,6 +1,0 @@
- Engineers perform all types of software testing activities to
-perform a software test process.
-
- The last quality checking point for software on its production
-line
-

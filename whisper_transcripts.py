@@ -6,6 +6,8 @@ import warnings
 import re
 import os
 import shutil
+from io import BytesIO
+import tempfile
 
 class Whisper_transcripts:
     def __init__(self, spacy_model="en_core_web_sm"):
@@ -13,22 +15,22 @@ class Whisper_transcripts:
         self.nlp=spacy.load(spacy_model)
         self.whisper_model=whisper.load_model("base")
     
-    def transcribe(self,filepath):
-        audio=AudioSegment.from_file(filepath)
+    def transcribe(self,file_buffer,extension):
+        file_buffer.seek(0)
+        audio=AudioSegment.from_file(file_buffer, format=extension.lstrip("."))
         chunks=make_chunks(audio, 30000)
-        chunks_dir="chunks"
-        os.makedirs(chunks_dir, exist_ok=True)
+        
         transcript=""
-        for i, chunk in enumerate(chunks):
-            chunk_filename=os.path.join(chunks_dir, f"chunk{i}.wav")
-            chunk.export(chunk_filename, format="wav")
-            result=self.whisper_model.transcribe(chunk_filename)
-            transcript+=result['text']+" "
-        shutil.rmtree(chunks_dir)
+        for chunk in chunks:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                chunk.export(tmpfile.name, format="wav")
+                result = self.whisper_model.transcribe(tmpfile.name)
+                transcript += result["text"] + " "
+
         return transcript
     
-    def process_audio_video(self, filepath):
-        text=self.transcribe(filepath)
+    def process_audio_video(self, file_buffer,extension):
+        text=self.transcribe(file_buffer,extension)
         text=re.sub(r'\s+',' ',text)
         text=re.sub(r'[^\w\s,!?]','',text)
         text=re.sub(r'([.,?])\1+',r'\1',text)

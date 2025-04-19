@@ -1,62 +1,97 @@
 import os
 from OCR_processing import OCR_processing
 from image_text_extraction import Image_text_Extraactor
-from langchain_trial import Chatbot_response
+from langchain_trial import run_chatbot
 from qdrant_chunking import QdrantChunking
 from qdrant_retrieval import Qdrant_retrieval
 from whisper_transcripts import Whisper_transcripts
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify,send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify,send_from_directory,abort,Response
 import speech_recognition as sr
+import asyncio
+from pymongo import MongoClient
+from gridfs import GridFSBucket
+import mimetypes
+import io
+
+
 
 class FileProcessor:
-    def __init__(self, folder):
+    def __init__(self, folder,mongo_client, fs_bucket,db):
         self.upload_folder=folder
         os.makedirs(folder, exist_ok=True)
         self.ocr=OCR_processing()
         self.image_processing=Image_text_Extraactor()
         self.transcripts=Whisper_transcripts()
+        self.client = mongo_client
+        self.db=db
+        self.fs_bucket=fs_bucket
     
     def save_file(self, files):
         uploaded_file_paths=[]
         for file in files:
             filename=file.filename
-            filepath=os.path.join(self.upload_folder,filename)
-            if not os.path.exists(filepath):
-                file.save(filepath)
-                uploaded_file_paths.append(filepath)
+            file.seek(0)
+            with self.fs_bucket.open_upload_stream(
+                filename,
+                chunk_size_bytes= 1048576,
+                metadata={"source":"direct_upload"}
+            ) as grid_in:
+                grid_in.write(file.read())
+            uploaded_file_paths.append(filename)
         return uploaded_file_paths
             
-    def process_files(self,filepaths):
-        for file in filepaths:
-            text=""
-            extension=os.path.splitext(file)[1].lower()
-            if extension in (".mp4",".mp3",".wav"):
-                text+=self.transcripts.process_audio_video(file)
-            elif extension in (".doc",".docx"):
-                text+=self.ocr.doc_text(file)
-            elif extension==".pdf":
-                text+=self.ocr.pdf_text(file)
-            elif extension in (".png",".jpg",".jpeg"):
-                text+=self.image_processing.image_extraction(file)
-            self.save_text_file(file, text)
+    def process_files(self,filenames):
+        for filename in filenames:
+            text = ""
+            extension = os.path.splitext(filename)[1].lower()
 
-    def save_text_file(self, file, text):
-        base_name=os.path.basename(file)
-        filename_no_ext=os.path.splitext(base_name)[0]
-        text_file=f"{filename_no_ext}.txt"
-        path=os.path.join(self.upload_folder, text_file)
-        with open(path, "w") as file:
-            file.write(text)
+            # Download the file from GridFS to memory for processing
+            grid_out = self.fs_bucket.open_download_stream_by_name(filename)
+            file_data = grid_out.read()
+
+            file_buffer = io.BytesIO(file_data)
+
+            # Process based on file type
+            if extension in (".mp4", ".mp3", ".wav"):
+                text += self.transcripts.process_audio_video(file_buffer,extension)
+            elif extension in (".doc", ".docx"):
+                text += self.ocr.doc_text(file_buffer)
+            elif extension == ".pdf":
+                text += self.ocr.pdf_text(file_buffer)
+            elif extension in (".png", ".jpg", ".jpeg"):
+                text += self.image_processing.image_extraction(file_buffer)
+
+            # Save text back to GridFS
+            self.save_text_file(filename, text)
+
+            # Optionally remove temp file
+            #os.remove(temp_file_path)
+
+    def save_text_file(self, original_filename, text):
+        filename_no_ext = os.path.splitext(original_filename)[0]
+        text_file = f"{filename_no_ext}.txt"
+
+        with self.fs_bucket.open_upload_stream(
+            text_file,
+            chunk_size_bytes=1048576,
+            metadata={"source": "generated_text"}
+        ) as grid_in:
+            grid_in.write(text.encode("utf-8"))  # Write text as bytes
 
 app=Flask(__name__)
-UPLOAD_FOLDER = ["uploads"]
-file_processor = FileProcessor(UPLOAD_FOLDER[0])
+UPLOAD_FOLDER = "uploads"
+
 qdrant_chunking = QdrantChunking()
 collection_name="test_check1"
 query_processor=Qdrant_retrieval(collection_name)
-graph_runner=Chatbot_response()
 r = sr.Recognizer()
 conversations={}
+client = MongoClient("mongodb://localhost:27017/")
+db=client["file_db"]
+fs_bucket=GridFSBucket(db)
+file_processor = FileProcessor(UPLOAD_FOLDER,mongo_client=client,db=db,fs_bucket=fs_bucket)
+
+
 @app.route("/",methods=["GET","POST"])
 def home():
     if request.method=="POST":
@@ -64,34 +99,44 @@ def home():
         uploaded_file_paths=file_processor.save_file(files)
         if uploaded_file_paths:
             file_processor.process_files(uploaded_file_paths)
-            qdrant_chunking.builder_graph(UPLOAD_FOLDER[0],collection_name)
+            qdrant_chunking.builder_graph(fs_bucket,collection_name)
         return redirect(url_for("home"))
-    folders=UPLOAD_FOLDER
-    transcript_files=[]
-    for i in folders:
-        transcript_files.extend([f for f in os.listdir(i) if f.endswith(".txt")])
+    #folders=UPLOAD_FOLDER
+    transcript_files=[file.filename for file in fs_bucket.find({"filename": {"$regex": r"\.txt$"}})]
     return render_template("index.html",transcript_files=transcript_files)
 
 @app.route("/download/<filename>")
 def download_file(filename):
-    for folder in UPLOAD_FOLDER:
-        file_path = os.path.join(folder, filename)
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True)
+    file_cursor = fs_bucket.find({"filename": filename})
+    file = next(file_cursor, None)
+    if not file:
+        abort(404)
     
-    flash("File not found!", "error")
-    return redirect(url_for("home"))
+    mime_type, _ = mimetypes.guess_type(filename)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    return Response(
+        file.read(),
+        mimetype=mime_type,
+        headers={"Content-Disposition":f"attachment; filename={filename}"}
+    )
+    #return redirect(url_for("home"))
 
 @app.route("/view/<filename>")
 def view_file(filename):
-    # Search for the file in UPLOAD_FOLDERS
-    for folder in UPLOAD_FOLDER:
-        file_path = os.path.join(folder, filename)
-        if os.path.exists(file_path):
-            return send_from_directory(folder, filename)
-
-    flash("File not found!", "error")
-    return redirect(url_for("home"))
+    #finding filename
+    file_cursor = fs_bucket.find({"filename": filename})
+    file = next(file_cursor, None)
+    if not file:
+        return abort(404)
+    
+    if filename.endswith(".txt"):
+        content=file.read().decode("utf-8")
+        return Response(content, mimetype="text/plain")
+    mime_type, _ = mimetypes.guess_type(filename)
+    return Response(file.read(), mimetype=mime_type or "application/octet-stream")
+    #return redirect(url_for("home"))
 
 @app.route("/chatbot")
 def chatbot():
@@ -110,9 +155,12 @@ def chatbot_query():
         
         previous_answer=[]
         previous_question=""
+        previous_role=""
         if session_id in conversations:
             previous_question=conversations[session_id].get("previous_question","")
             previous_answer=conversations[session_id].get("previous_answer",[])
+            previous_role=conversations[session_id].get("previous_role","")
+
 
         # Process user query through DissertationQueryProcessor
         retrieved_chunks = query_processor.qdrant_retrieve(user_input)
@@ -120,16 +168,19 @@ def chatbot_query():
         "retreived_chunks": retrieved_chunks,
         "role": role,
         "model": "mistral",
+        "previous_role":previous_role,
         "previous_question":previous_question,
         "previous_answer":previous_answer,
         "current_question":user_input
     }
-        response=graph_runner.run(input_state)
+        response=asyncio.run(run_chatbot(input_state))
 
         #updating session memory
         conversations[session_id]={
             "previous_question":user_input,
-            "previous_answer":response["rephrased_chunks"]
+            "previous_answer":response["rephrased_chunks"],
+            "previous_role":role
+
         }
         return jsonify({"response": response["rephrased_chunks"]}), 200
     except Exception as e:

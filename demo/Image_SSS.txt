@@ -1,0 +1,11 @@
+
+
+Elseviers Five Responsible Al Principles
+
+ We consider the realworld impact of our solutions on people
+ We take action to prevent the creation or reinforcement of unfair bias
+ We can explain how our solutions work
+
+ We create accountability through human oversight
+
+ We respect privacy and champion robust data governance
